@@ -13,6 +13,9 @@ import (
 )
 
 const winDenom = 2
+const purrMinPower float64 = 0.1
+
+var pwOpts = &spectral.PwelchOptions{NFFT: 16384, Scale_off: true}
 
 type hit struct {
 	t    float64
@@ -31,6 +34,117 @@ func main() {
 }
 
 func stuff() error {
+	samples, sampleRate, err := readSamples()
+	if err != nil {
+		return err
+	}
+
+	c := 0
+	for c >= 0 && c <= len(samples) {
+		c = findNextCandidate(samples[c:], sampleRate, 55, 170, c)
+		c += int(sampleRate)
+	}
+
+	return nil
+}
+
+func findNextCandidate(samples []float64, sampleRate, min, max float64, c0 int) int {
+	sr := int(sampleRate)
+
+	for c := 0; c+sr < len(samples); c += sr {
+		pxx, freqs := spectral.Pwelch(samples[c:c+sr], sampleRate, pwOpts)
+		globalPeakPower, globalPeakFreq := findPeak(pxx, freqs, 32, 880)
+		localPeakPower, localPeakFreq := findPeak(pxx, freqs, min, max)
+
+		if !dsputils.Float64Equal(globalPeakPower, localPeakPower) {
+			if globalPeakFreq < localPeakFreq || !areHarmonic(globalPeakFreq, localPeakFreq) {
+				continue
+			}
+		}
+
+		if localPeakPower < purrMinPower {
+			continue
+		}
+
+		fmt.Printf("Candidate at %v (local peak: %f Hz (%.2f), global peak: %f Hz (%.2f))\n", fmtSeconds(float64(c+c0)/sampleRate), localPeakFreq, localPeakPower, globalPeakFreq, globalPeakPower)
+		findRepeats(samples[c:], sampleRate, localPeakFreq, true, true)
+
+		return c + c0
+	}
+
+	return -1
+}
+
+func findRepeats(samples []float64, sampleRate, baseFreq float64, lookBelow, lookAbove bool) {
+	if !lookBelow && !lookAbove {
+		fmt.Println("findRepeats: both lookBelow and lookAbove are false.")
+	}
+
+	win0 := int(2.9 * sampleRate)
+
+	if win0 >= len(samples) {
+		fmt.Println("findRepeats: reached the end of the samples.")
+		return
+	}
+
+	win1 := minInt(int(6.1*sampleRate), len(samples))
+
+	if win1-win0 < int(sampleRate) {
+		fmt.Println("findRepeats: reached near the end of the samples.")
+		return
+	}
+
+	freqBelow := baseFreq / 1.5
+	freqAbove := baseFreq * 1.5
+
+	pxx, freqs := spectral.Pwelch(samples[win0:win1], sampleRate, pwOpts)
+	peakPowerBelow, peakFreqBelow := findPeak(pxx, freqs, freqBelow/1.1, freqBelow*1.1)
+	peakPowerAbove, peakFreqAbove := findPeak(pxx, freqs, freqAbove/1.1, freqAbove*1.1)
+
+	var repeatPower float64 = 0
+	var repeatFreq float64 = 0
+	foundBelow := false
+	foundAbove := false
+
+	if lookBelow {
+		if lookAbove {
+			if peakPowerBelow > peakPowerAbove {
+				repeatPower = peakPowerBelow
+				repeatFreq = peakFreqBelow
+				foundBelow = true
+			} else {
+				repeatPower = peakPowerAbove
+				repeatFreq = peakFreqAbove
+				foundAbove = true
+			}
+		} else {
+			repeatPower = peakPowerBelow
+			repeatFreq = peakFreqBelow
+			foundBelow = true
+		}
+	} else {
+		repeatPower = peakPowerAbove
+		repeatFreq = peakFreqAbove
+		foundAbove = true
+	}
+
+	if repeatPower >= purrMinPower {
+		fmt.Printf("Repeat candidate: %f Hz (%.2f)\n", repeatFreq, repeatPower)
+		findRepeats(samples[int(4*sampleRate):], sampleRate, baseFreq, lookBelow && foundBelow, lookAbove && foundAbove)
+	} else {
+		fmt.Println("No further repeat candidates found.")
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func stuff2() error {
 	hits, err := getHits()
 	if err != nil {
 		return err
@@ -113,6 +227,25 @@ func getHits() ([]hit, error) {
 	}
 
 	return hits, nil
+}
+
+func readSamples() ([]float64, float64, error) {
+	w, err := wav.New(os.Stdin)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	log.Printf("format: %d, channels: %d, sample rate: %d, byte rate: %d, bps: %d, samples: %d, duration: %v\n",
+		w.Header.AudioFormat, w.Header.NumChannels, w.Header.SampleRate,
+		w.Header.ByteRate, w.Header.BitsPerSample, w.Samples, w.Duration)
+
+	rawSamples, err := w.ReadFloats(w.Samples)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	flatSamples := flattenChannels(int(w.Header.NumChannels), rawSamples)
+	return flatSamples, float64(w.Header.SampleRate), nil
 }
 
 func flattenChannels(numChannels int, samples []float32) []float64 {
